@@ -223,17 +223,57 @@ def transition_prob(route_dist, gc_dist, beta=20.0):
     return (1.0 / beta) * np.exp(-dt / beta)
 
 
-def compute_route_distance(arc_from, arc_to, arcs, graph, penalty=2000.0):
+def align_gps_to_route_arcs(track, nodes, arcs, route_arcs):
+    """Map each GPS point monotonically to its closest arc along the ground-truth route."""
+    if len(route_arcs) == len(track):
+        return [int(a) for a in route_arcs]
+
+    route_mids = np.array([
+        (nodes[arcs[a, 0]] + nodes[arcs[a, 1]]) / 2.0 for a in route_arcs
+    ])
+    assigned = []
+    curr_idx = 0
+    window = max(15, len(route_arcs) // 5)
+    for i in range(len(track)):
+        end_idx = min(len(route_arcs), curr_idx + window)
+        sub_mids = route_mids[curr_idx:end_idx]
+        d = (sub_mids[:, 0] - track[i, 0]) ** 2 + (sub_mids[:, 1] - track[i, 1]) ** 2
+        best_offset = int(np.argmin(d))
+        curr_idx = curr_idx + best_offset
+        assigned.append(int(route_arcs[curr_idx]))
+    return assigned
+
+
+def compute_route_distance(arc_from, arc_to, nodes, arcs, graph, penalty=2000.0, cache=None):
+    if arc_from == arc_to:
+        return 0.0
+
     end_node = arcs[arc_from][1]
     start_node = arcs[arc_to][0]
 
-    if end_node == start_node or arc_from == arc_to:
+    if end_node == start_node:
         return 0.0
 
+    key = (end_node, start_node)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    fn_coord = nodes[end_node]
+    tn_coord = nodes[start_node]
+    straight_d = haversine(fn_coord[0], fn_coord[1], tn_coord[0], tn_coord[1])
+    if straight_d > 600.0:
+        if cache is not None:
+            cache[key] = penalty
+        return penalty
+
     try:
-        path = nx.shortest_path(graph, end_node, start_node, weight="length")
-        return sum(graph[path[i]][path[i + 1]]["length"] for i in range(len(path) - 1))
+        dist = nx.shortest_path_length(graph, end_node, start_node, weight="length")
+        if cache is not None:
+            cache[key] = dist
+        return dist
     except (nx.NetworkXNoPath, nx.NodeNotFound):
+        if cache is not None:
+            cache[key] = penalty
         return penalty
 
 
@@ -268,6 +308,7 @@ def viterbi_decode(candidates_per_obs, track, nodes, arcs, graph,
         backpointer[0][arc_id] = None
 
     # 2. Recurrence
+    dist_cache = {}
     for t in range(1, len(valid_obs)):
         curr_idx, curr_cands = valid_obs[t]
         prev_idx, prev_cands = valid_obs[t - 1]
@@ -285,7 +326,7 @@ def viterbi_decode(candidates_per_obs, track, nodes, arcs, graph,
             for arc_prev, _, _ in prev_cands:
                 if arc_prev not in V[t - 1]:
                     continue
-                rd = compute_route_distance(arc_prev, arc_curr, arcs, graph)
+                rd = compute_route_distance(arc_prev, arc_curr, nodes, arcs, graph, cache=dist_cache)
                 log_t = np.log(max(transition_prob(rd, gc_dist, beta), 1e-300))
                 prob = V[t - 1][arc_prev] + log_t + log_e
                 if prob > best_val:
@@ -405,10 +446,10 @@ def run_evaluation_pipeline(trip_id="00000001", num_obs=100):
 
     # 6. Evaluation Table Output
     if trip["route"] is not None:
-        gt = trip["route"][:num_obs].tolist()
-        m_closest = evaluate_route(pred_closest, gt)
-        m_ml = evaluate_route(pred_ml_only, gt)
-        m_hmm = evaluate_route(pred_hmm, gt)
+        gt_aligned = align_gps_to_route_arcs(eval_track, trip["nodes"], trip["arcs"], trip["route"])
+        m_closest = evaluate_route(pred_closest, gt_aligned)
+        m_ml = evaluate_route(pred_ml_only, gt_aligned)
+        m_hmm = evaluate_route(pred_hmm, gt_aligned)
 
         print("\n" + "=" * 70)
         print("REPORT SECTION 5: MODEL EXPERIMENTATION & COMPARISON TABLE")
@@ -422,6 +463,18 @@ def run_evaluation_pipeline(trip_id="00000001", num_obs=100):
         print("-" * 70)
         print(f"Decoding Time: {hmm_time:.2f}s for {num_obs} observations")
         print("=" * 70)
+
+        # Save to results/
+        try:
+            results_df = pd.DataFrame([
+                {"Method": "1. Baseline (Closest Arc)", "Top-1 Accuracy": m_closest["accuracy"], "Route Continuity": m_closest["continuity"]},
+                {"Method": "2. ML Classifier-Only (Argmax)", "Top-1 Accuracy": m_ml["accuracy"], "Route Continuity": m_ml["continuity"]},
+                {"Method": "3. PathSnap (ML + HMM Viterbi)", "Top-1 Accuracy": m_hmm["accuracy"], "Route Continuity": m_hmm["continuity"]},
+            ])
+            results_df.to_csv(os.path.join(PROJECT_ROOT, "results", "hmm_evaluation.csv"), index=False)
+            print(f"[✔] Saved HMM comparison to results/hmm_evaluation.csv")
+        except Exception as e:
+            print(f"[!] Note: Could not save results/hmm_evaluation.csv ({e}). Proceeding.")
 
     # 7. Generate Folium Map for reports
     out_map = os.path.join(REPORTS_IMG_DIR, f"trip_{trip_id}_route_reconstruction.html")
