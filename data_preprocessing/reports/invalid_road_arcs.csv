@@ -1,9 +1,0 @@
-from_node_id,to_node_id,arc_id,length_m,self_loop,duplicate_directed_arc,valid_length
-25407,72348,51615,0.0,False,False,False
-33761,72024,67864,0.0,False,False,False
-45593,45594,89836,0.0,False,False,False
-45594,45593,89839,0.0,False,False,False
-72348,25407,136226,0.0,False,False,False
-78592,85421,147014,0.0,False,False,False
-85421,78592,159604,0.0,False,False,False
-85558,32380,159841,0.0,False,False,False
