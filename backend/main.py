@@ -21,6 +21,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_BASE = os.path.join(PROJECT_ROOT, "data")
 TRAIN_DIR = os.path.join(DATA_BASE, "train")
 STUDENT_TEST_DIR = os.path.join(DATA_BASE, "student_test")
+EVALUATOR_TEST_DIR = os.path.join(DATA_BASE, "evaluator_test")
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
 # HMM parameters
@@ -118,12 +119,34 @@ def compute_ml_candidate_probs(model, candidates, track, nodes, arcs):
     return {k: float(s) for k, s in zip(keys, scores)}
 
 
+def align_gps_to_route_arcs(track, nodes, arcs, route_arcs):
+    """Map each GPS point monotonically to its closest arc along the ground-truth route."""
+    if len(route_arcs) == len(track):
+        return [int(a) for a in route_arcs]
+
+    route_mids = np.array([
+        (nodes[arcs[a, 0]] + nodes[arcs[a, 1]]) / 2.0 for a in route_arcs
+    ])
+    assigned = []
+    curr_idx = 0
+    window = max(15, len(route_arcs) // 5)
+    for i in range(len(track)):
+        end_idx = min(len(route_arcs), curr_idx + window)
+        sub_mids = route_mids[curr_idx:end_idx]
+        d = (sub_mids[:, 0] - track[i, 0]) ** 2 + (sub_mids[:, 1] - track[i, 1]) ** 2
+        best_offset = int(np.argmin(d))
+        curr_idx = curr_idx + best_offset
+        assigned.append(int(route_arcs[curr_idx]))
+    return assigned
+
+
 def get_trip_dir(trip_id):
-    """Find which partition a trip belongs to."""
-    for partition in [TRAIN_DIR, STUDENT_TEST_DIR]:
-        trip_path = os.path.join(partition, trip_id)
-        if os.path.isdir(trip_path):
-            return trip_path
+    """Find which partition a trip belongs to (evaluator_test, student_test, or train)."""
+    for partition in [EVALUATOR_TEST_DIR, STUDENT_TEST_DIR, TRAIN_DIR]:
+        if os.path.isdir(partition):
+            trip_path = os.path.join(partition, trip_id)
+            if os.path.isdir(trip_path):
+                return trip_path
     return None
 
 
@@ -157,9 +180,10 @@ def make_folium_map(trip, predicted_route, ground_truth=None):
     center_lon = np.mean(track[:, 0])
     m = folium.Map(location=[center_lat, center_lon], zoom_start=14)
 
-    # GPS points (blue)
+    # GPS points (blue) - downsample if track is very large for fast rendering
     gps_group = folium.FeatureGroup(name="GPS Points")
-    for i in range(len(track)):
+    step = max(1, len(track) // 600)
+    for i in range(0, len(track), step):
         folium.CircleMarker(
             location=[track[i, 1], track[i, 0]],
             radius=3, color="blue", fill=True, fill_opacity=0.6,
@@ -214,13 +238,16 @@ def root():
 
 @app.get("/trips")
 def list_trips():
-    """List available evaluation trips (student_test partition)."""
+    """List available evaluation trips. Prioritizes evaluator_test if available."""
+    target_dir = EVALUATOR_TEST_DIR if (os.path.isdir(EVALUATOR_TEST_DIR) and len(os.listdir(EVALUATOR_TEST_DIR)) > 0) else STUDENT_TEST_DIR
+    partition_name = "evaluator_test" if target_dir == EVALUATOR_TEST_DIR else "student_test"
     trip_ids = []
-    for tid in sorted(os.listdir(STUDENT_TEST_DIR)):
-        if os.path.isdir(os.path.join(STUDENT_TEST_DIR, tid)):
-            trip_ids.append(tid)
-    logger.info(f"Listed {len(trip_ids)} evaluation trips")
-    return {"trips": trip_ids, "count": len(trip_ids)}
+    if os.path.isdir(target_dir):
+        for tid in sorted(os.listdir(target_dir)):
+            if os.path.isdir(os.path.join(target_dir, tid)):
+                trip_ids.append(tid)
+    logger.info(f"Listed {len(trip_ids)} trips from {partition_name}")
+    return {"trips": trip_ids, "count": len(trip_ids), "partition": partition_name}
 
 
 @app.get("/predict/{trip_id}")
@@ -272,8 +299,9 @@ def predict_route(trip_id: str):
     ground_truth = None
     if trip["route"] is not None:
         ground_truth = trip["route"].tolist()
-        metrics = evaluate_route(predicted_route, ground_truth)
-        logger.info(f"Evaluation: accuracy={metrics['accuracy']}, "
+        aligned_gt = align_gps_to_route_arcs(trip["track"], trip["nodes"], trip["arcs"], trip["route"])
+        metrics = evaluate_route(predicted_route, aligned_gt)
+        logger.info(f"Evaluation: Top-1 accuracy={metrics['accuracy']}, "
                     f"matched={metrics['matched']}/{metrics['total']}, "
                     f"continuity={metrics['continuity']}")
     else:

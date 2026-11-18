@@ -44,11 +44,14 @@ def get_arc_center(arc_id, nodes, arcs):
     return (from_coords + to_coords) / 2.0
 
 
-def compute_route_distance(arc_id_from, arc_id_to, nodes, arcs, graph, max_hops=8):
+def compute_route_distance(arc_id_from, arc_id_to, nodes, arcs, graph, max_hops=8, cache=None):
     """
     Approximate route distance between two arcs using shortest path on the graph.
     Returns distance in meters. If no path found, returns a large penalty.
     """
+    if arc_id_from == arc_id_to:
+        return 0.0
+
     to_node_of_from_arc = arcs[arc_id_from][1]  # end node of first arc
     from_node_of_to_arc = arcs[arc_id_to][0]    # start node of second arc
 
@@ -56,21 +59,30 @@ def compute_route_distance(arc_id_from, arc_id_to, nodes, arcs, graph, max_hops=
     if to_node_of_from_arc == from_node_of_to_arc:
         return 0.0
 
-    # Same arc
-    if arc_id_from == arc_id_to:
-        return 0.0
+    key = (to_node_of_from_arc, from_node_of_to_arc)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    # Pre-check: if straight line distance is too large, avoid Dijkstra entirely
+    fn_coord = nodes[to_node_of_from_arc]
+    tn_coord = nodes[from_node_of_to_arc]
+    straight_d = haversine(fn_coord[0], fn_coord[1], tn_coord[0], tn_coord[1])
+    if straight_d > 600.0:
+        if cache is not None:
+            cache[key] = 2000.0
+        return 2000.0
 
     try:
-        path = nx.shortest_path(
+        dist = nx.shortest_path_length(
             graph, to_node_of_from_arc, from_node_of_to_arc, weight="length"
         )
-        dist = sum(
-            graph[path[i]][path[i+1]]["length"]
-            for i in range(len(path) - 1)
-        )
+        if cache is not None:
+            cache[key] = dist
         return dist
     except (nx.NetworkXNoPath, nx.NodeNotFound):
-        return 2000.0  # large penalty for disconnected segments
+        if cache is not None:
+            cache[key] = 2000.0
+        return 2000.0
 
 
 def viterbi_decode(candidates_per_obs, track, nodes, arcs, graph,
@@ -120,6 +132,7 @@ def viterbi_decode(candidates_per_obs, track, nodes, arcs, graph,
         backpointer[0][arc_id] = None
 
     # === Recursion ===
+    dist_cache = {}
     for t in range(1, len(valid_obs)):
         curr_obs_idx, curr_cands = valid_obs[t]
         prev_obs_idx, prev_cands = valid_obs[t - 1]
@@ -145,9 +158,9 @@ def viterbi_decode(candidates_per_obs, track, nodes, arcs, graph,
                 if arc_id_prev not in V[t - 1]:
                     continue
 
-                # Compute route distance between arcs
+                # Compute route distance between arcs (with cache)
                 route_dist = compute_route_distance(
-                    arc_id_prev, arc_id_curr, nodes, arcs, graph, max_hops=8
+                    arc_id_prev, arc_id_curr, nodes, arcs, graph, max_hops=8, cache=dist_cache
                 )
                 trans = transition_prob(route_dist, gc_dist, beta)
                 log_trans = np.log(max(trans, 1e-300))
