@@ -1,116 +1,136 @@
-"""
-PathSnap Evaluator Dashboard (Laptop 2)
-Author: PathSnap Team
-"""
+"""Evaluator-facing Streamlit UI for the PathSnap API."""
 
-import streamlit as st
+import os
+
 import requests
+import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(
-    page_title="PathSnap | Distributed Map-Matching Dashboard",
-    page_icon="🗺️",
-    layout="wide"
+
+st.set_page_config(page_title="PathSnap Evaluator", page_icon="🗺️", layout="wide")
+st.title("PathSnap: Route Reconstruction")
+st.caption(
+    "Select an evaluation trip to run map matching. Route scoring is performed "
+    "by the API; reference route labels are not sent to this interface."
 )
 
-# Header
-st.title("🗺️ PathSnap: Distributed Map-Matching & Route Reconstruction")
-st.caption("Distributed Evaluation Interface running on Laptop 2 | Communicating with Model & HMM API on Laptop 1")
+default_api_url = os.getenv("PATHSNAP_API_URL", "http://10.143.193.155:8000")
+api_base_url = st.sidebar.text_input(
+    "Backend API URL", value=default_api_url
+).strip().rstrip("/")
+request_timeout_seconds = 180
 
-# Sidebar Configuration
-st.sidebar.header("⚙️ Server Configuration")
-api_base = st.sidebar.text_input(
-    "Laptop 1 API Base URL",
-    value="http://localhost:8000",
-    help="Enter the IP address of Laptop 1 (e.g., http://192.168.1.15:8000)"
-).rstrip("/")
 
-# Health Check & Fetch Trips
-trips = []
-partition_name = "evaluator_test"
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_evaluation_trips(base_url):
+    response = requests.get(f"{base_url}/trips", timeout=15)
+    response.raise_for_status()
+    payload = response.json()
+    trips = payload.get("trips")
+    if not isinstance(trips, list):
+        raise ValueError("The API response did not contain a 'trips' list.")
+    return sorted(str(trip_id) for trip_id in trips)
+
+
 try:
-    resp = requests.get(f"{api_base}/trips", timeout=3)
-    if resp.status_code == 200:
-        data = resp.json()
-        trips = data.get("trips", [])
-        partition_name = data.get("partition", "evaluator_test")
-        st.sidebar.success(f"🟢 Connected to Laptop 1 API ({len(trips)} {partition_name} trips available)")
-    else:
-        st.sidebar.warning(f"⚠️ API returned status {resp.status_code}")
-except Exception as e:
-    st.sidebar.error(f"🔴 Cannot reach Laptop 1 API at {api_base}")
-    # Fallback to known evaluation trips if disconnected
-    trips = [
-        "00000015", "00000017", "00000023", "00000030", "00000049",
-        "00000059", "00000067", "00000073", "00000087", "00000094"
-    ]
+    trip_ids = fetch_evaluation_trips(api_base_url)
+except requests.HTTPError as exc:
+    detail = ""
+    try:
+        detail = exc.response.json().get("detail", "")
+    except (AttributeError, ValueError):
+        pass
+    st.error(detail or f"The PathSnap API returned an error: {exc}")
+    st.stop()
+except requests.RequestException as exc:
+    st.error(
+        f"Could not reach the PathSnap API at {api_base_url}. "
+        "Confirm the backend is running and that this URL uses the backend "
+        "laptop's reachable IP address."
+    )
+    st.code(str(exc))
+    st.stop()
+except (ValueError, requests.exceptions.JSONDecodeError) as exc:
+    st.error(f"Could not read the evaluation trip list: {exc}")
+    st.stop()
 
-# Evaluation Selection
-st.sidebar.subheader("🎯 Evaluation Selection")
-selected_trip = st.sidebar.selectbox(
-    f"Select Reserved Trip ({partition_name})",
-    options=trips if trips else ["00000015"],
-    index=0
+if not trip_ids:
+    st.error("The API returned no evaluation trips.")
+    st.stop()
+
+if len(trip_ids) != 10:
+    st.warning(
+        f"The API returned {len(trip_ids)} trips; the evaluator workflow expects 10. "
+        "Check that the backend is configured with the reserved evaluation partition."
+    )
+else:
+    st.success("10 evaluation trips are available.")
+
+selected_trip = st.selectbox(
+    "Evaluation trip",
+    options=trip_ids,
+    format_func=lambda trip_id: f"Trip {trip_id}",
 )
 
-predict_btn = st.sidebar.button("🚀 Reconstruct Route & Evaluate", type="primary", use_container_width=True)
-
-# Main Application Window
-if predict_btn or ("last_trip" in st.session_state and st.session_state["last_trip"] == selected_trip):
-    st.session_state["last_trip"] = selected_trip
-
-    with st.spinner(f"Requesting inference for Trip {selected_trip} from Laptop 1..."):
+if st.button("Run map matching and evaluate", type="primary", use_container_width=True):
+    try:
+        with st.spinner(f"Processing trip {selected_trip} on the API server..."):
+            response = requests.get(
+                f"{api_base_url}/predict/{selected_trip}",
+                timeout=request_timeout_seconds,
+            )
+            response.raise_for_status()
+            result = response.json()
+        st.session_state["pathsnap_result"] = result
+        st.session_state["pathsnap_result_trip"] = selected_trip
+    except requests.HTTPError as exc:
+        detail = ""
         try:
-            req_url = f"{api_base}/predict/{selected_trip}"
-            res = requests.get(req_url, timeout=30)
+            detail = response.json().get("detail", "")
+        except (ValueError, UnboundLocalError):
+            pass
+        st.error(f"The API could not process trip {selected_trip}. {detail or exc}")
+    except requests.RequestException as exc:
+        st.error(f"The API request failed: {exc}")
+    except ValueError as exc:
+        st.error(f"The API returned invalid JSON: {exc}")
 
-            if res.status_code == 200:
-                result = res.json()
-                metrics = result.get("metrics", {})
-                timing = result.get("timing", {})
 
-                # Metric Cards
-                st.subheader(f"📊 Evaluation Results for Trip `{selected_trip}`")
-                c1, c2, c3, c4 = st.columns(4)
+result = st.session_state.get("pathsnap_result")
+result_trip = st.session_state.get("pathsnap_result_trip")
+if result and result_trip == selected_trip:
+    st.divider()
+    st.subheader(f"Results for trip {selected_trip}")
 
-                top1_acc = metrics.get("accuracy", 0.0)
-                continuity = metrics.get("continuity", 0.0)
-                matched = metrics.get("matched", 0)
-                total = metrics.get("total", 0)
-                total_time = timing.get("total_s", 0.0)
+    metrics = result.get("metrics") or {}
+    metric_columns = st.columns(4)
+    metric_columns[0].metric(
+        "Route accuracy",
+        f"{metrics['accuracy']:.1%}" if isinstance(metrics.get("accuracy"), (int, float)) else "N/A",
+    )
+    metric_columns[1].metric(
+        "Route continuity",
+        f"{metrics['continuity']:.1%}" if isinstance(metrics.get("continuity"), (int, float)) else "N/A",
+    )
+    metric_columns[2].metric("Matched route arcs", metrics.get("matched", "N/A"))
+    metric_columns[3].metric("GPS observations", result.get("num_gps_points", "N/A"))
 
-                c1.metric("Top-1 Observation Accuracy", f"{top1_acc * 100:.1f}%")
-                c2.metric("Route Continuity", f"{continuity * 100:.1f}%")
-                c3.metric("Matched Arcs", f"{matched} / {total}")
-                c4.metric("Inference Latency", f"{total_time:.2f} s")
+    timing = result.get("timing") or {}
+    if timing:
+        st.caption(
+            "Processing time: "
+            f"{timing.get('total_s', 'N/A')} s total; "
+            f"{timing.get('candidate_generation_s', 'N/A')} s candidate generation; "
+            f"{timing.get('viterbi_decoding_s', 'N/A')} s route decoding."
+        )
 
-                # Map Display
-                st.markdown("---")
-                st.subheader("🗺️ Interactive Trajectory Reconstruction")
-                st.caption(
-                    "🔵 **Blue circles**: Raw GPS observations with urban multipath noise | "
-                    "🔴 **Red line**: PathSnap ML + HMM reconstructed route | "
-                    "🟢 **Green line**: Ground truth road segment traversal"
-                )
+    map_html = result.get("map_html")
+    if map_html:
+        st.subheader("GPS observations and predicted route")
+        components.html(map_html, height=620, scrolling=True)
+    else:
+        st.info("The API response did not include a route map.")
 
-                map_html = result.get("map_html", "")
-                if map_html:
-                    components.html(map_html, height=620, scrolling=True)
-                else:
-                    st.warning("No map rendering received from server.")
-
-            else:
-                st.error(f"Server Error {res.status_code}: {res.text}")
-
-        except Exception as e:
-            st.error(f"Failed to communicate with Laptop 1 API: {e}")
-
-else:
-    # Landing instructions
-    st.info("👈 **Select any of the 10 reserved evaluation trips in the sidebar and click 'Reconstruct Route & Evaluate'.**")
-    st.markdown("""
-    ### System Architecture:
-    - **Laptop 1 (Backend)**: Runs the FastAPI server hosting the trained **MLP Neural Network Classifier** + **Viterbi HMM Decoder**.
-    - **Laptop 2 (Frontend)**: Runs this Streamlit evaluation dashboard.
-    - **Security & Integrity**: Ground-truth route labels remain strictly server-side on Laptop 1 and are never transmitted to the client.
-    """)
+    with st.expander("Predicted arc IDs"):
+        predicted_route = result.get("predicted_route") or []
+        st.write(predicted_route if predicted_route else "No route arcs were returned.")
