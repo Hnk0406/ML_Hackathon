@@ -23,8 +23,36 @@ from sklearn.neural_network import MLPClassifier
 import lightgbm as lgb
 
 DATA_BASE = "data"
+PROCESSED_BASE = os.path.join(DATA_BASE, "csv_output", "processed")
 TRAIN_DIR = os.path.join(DATA_BASE, "train")
 STUDENT_TEST_DIR = os.path.join(DATA_BASE, "student_test")
+
+
+def load_preprocessed_trip(partition_dir, trip_id):
+    """Load P1 preprocessed GPS, node, and arc CSVs alongside ground-truth .route."""
+    partition = os.path.basename(partition_dir)
+    gps_csv = os.path.join(PROCESSED_BASE, partition, f"{trip_id}.csv")
+    rn_dir = os.path.join(PROCESSED_BASE, "road_network", partition, trip_id)
+    nodes_csv = os.path.join(rn_dir, f"{trip_id}_processed_nodes.csv")
+    arcs_csv = os.path.join(rn_dir, f"{trip_id}_processed_arcs.csv")
+
+    raw_trip = load_trip(os.path.join(partition_dir, trip_id), trip_id)
+    if not (os.path.exists(gps_csv) and os.path.exists(nodes_csv) and os.path.exists(arcs_csv)):
+        return raw_trip, None, None
+
+    gps_df = pd.read_csv(gps_csv)
+    track = gps_df[["longitude", "latitude", "timestamp"]].to_numpy(dtype=np.float64)
+    p1_speed_ms = (gps_df["speed_from_previous_kmh"].fillna(0.0).to_numpy(dtype=np.float64)) / 3.6
+
+    nodes_df = pd.read_csv(nodes_csv).sort_values("node_id")
+    nodes = nodes_df[["longitude", "latitude"]].to_numpy(dtype=np.float64)
+
+    arcs_df = pd.read_csv(arcs_csv).sort_values("arc_id")
+    arcs = arcs_df[["from_node_id", "to_node_id"]].to_numpy(dtype=np.int64)
+    p1_arc_len = arcs_df["length_m"].to_numpy(dtype=np.float64)
+
+    trip = {"track": track, "nodes": nodes, "arcs": arcs, "route": raw_trip["route"]}
+    return trip, p1_speed_ms, p1_arc_len
 MODELS_DIR = "models"
 RESULTS_DIR = "results"
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -59,7 +87,7 @@ def build_dataset(partition_dir, max_obs_per_trip=250, is_train=True):
     rows = []
     trip_ids = get_trip_ids(partition_dir)
     for trip_id in trip_ids:
-        trip = load_trip(os.path.join(partition_dir, trip_id), trip_id)
+        trip, p1_speed_ms, p1_arc_len = load_preprocessed_trip(partition_dir, trip_id)
         track, nodes, arcs, route = trip["track"], trip["nodes"], trip["arcs"], trip["route"]
         if route is None or len(route) == 0:
             continue
@@ -84,7 +112,7 @@ def build_dataset(partition_dir, max_obs_per_trip=250, is_train=True):
 
             for arc_id, dist_m, proj_t in cands:
                 fn, tn = arcs[arc_id]
-                arc_len = haversine(nodes[fn, 0], nodes[fn, 1], nodes[tn, 0], nodes[tn, 1])
+                arc_len = float(p1_arc_len[arc_id]) if p1_arc_len is not None else haversine(nodes[fn, 0], nodes[fn, 1], nodes[tn, 0], nodes[tn, 1])
                 d_lon = nodes[tn, 0] - nodes[fn, 0]
                 d_lat = nodes[tn, 1] - nodes[fn, 1]
                 arc_heading = np.degrees(np.arctan2(d_lon, d_lat)) % 360.0
