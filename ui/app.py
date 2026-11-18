@@ -7,7 +7,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 
-st.set_page_config(page_title="PathSnap Evaluator", page_icon="🗺️", layout="wide")
+st.set_page_config(page_title="PathSnap Evaluator", layout="wide")
 st.title("PathSnap: Route Reconstruction")
 st.caption(
     "Select an evaluation trip to run map matching. Route scoring is performed "
@@ -18,12 +18,24 @@ default_api_url = os.getenv("PATHSNAP_API_URL", "http://10.143.193.155:8000")
 api_base_url = st.sidebar.text_input(
     "Backend API URL", value=default_api_url
 ).strip().rstrip("/")
+
+selected_partition = st.sidebar.selectbox(
+    "Dataset Partition",
+    options=["evaluator_test", "student_test", "train"],
+    index=0,
+    format_func=lambda p: {
+        "evaluator_test": "evaluator_test (10 Reserved)",
+        "student_test": "student_test (10 Development)",
+        "train": "train (80 Training)",
+    }.get(p, p),
+    help="Select which partition to load trips from. 'evaluator_test' is the primary reserved test set."
+)
 request_timeout_seconds = 180
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_evaluation_trips(base_url):
-    response = requests.get(f"{base_url}/trips", timeout=15)
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_evaluation_trips(base_url, partition):
+    response = requests.get(f"{base_url}/trips", params={"partition": partition}, timeout=15)
     response.raise_for_status()
     payload = response.json()
     trips = payload.get("trips")
@@ -33,7 +45,7 @@ def fetch_evaluation_trips(base_url):
 
 
 try:
-    trip_ids = fetch_evaluation_trips(api_base_url)
+    trip_ids = fetch_evaluation_trips(api_base_url, selected_partition)
 except requests.HTTPError as exc:
     detail = ""
     try:
@@ -55,20 +67,24 @@ except (ValueError, requests.exceptions.JSONDecodeError) as exc:
     st.stop()
 
 if not trip_ids:
-    st.error("The API returned no evaluation trips.")
+    st.error(f"The API returned no trips for partition '{selected_partition}'.")
     st.stop()
 
-if len(trip_ids) != 10:
-    st.warning(
-        f"The API returned {len(trip_ids)} trips; the evaluator workflow expects 10. "
-        "Check that the backend is configured with the reserved evaluation partition."
-    )
+if selected_partition == "evaluator_test":
+    if len(trip_ids) == 10:
+        st.success("10 reserved evaluation trips are available.")
+    else:
+        st.warning(
+            f"The API returned {len(trip_ids)} trips; the evaluator workflow expects 10. "
+            "Check that the backend is configured with the reserved evaluation partition."
+        )
 else:
-    st.success("10 evaluation trips are available.")
+    st.info(f"Loaded {len(trip_ids)} trips from the '{selected_partition}' partition.")
 
 selected_trip = st.selectbox(
-    "Evaluation trip",
+    f"Select Trip ({selected_partition})",
     options=trip_ids,
+    key=f"trip_select_{selected_partition}",
     format_func=lambda trip_id: f"Trip {trip_id}",
 )
 

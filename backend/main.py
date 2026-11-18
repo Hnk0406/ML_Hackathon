@@ -237,10 +237,16 @@ def root():
 
 
 @app.get("/trips")
-def list_trips():
-    """List available evaluation trips. Prioritizes evaluator_test if available."""
-    target_dir = EVALUATOR_TEST_DIR if (os.path.isdir(EVALUATOR_TEST_DIR) and len(os.listdir(EVALUATOR_TEST_DIR)) > 0) else STUDENT_TEST_DIR
-    partition_name = "evaluator_test" if target_dir == EVALUATOR_TEST_DIR else "student_test"
+def list_trips(partition: str = "evaluator_test"):
+    """List available trips for a given partition (evaluator_test, student_test, or train)."""
+    mapping = {
+        "evaluator_test": EVALUATOR_TEST_DIR,
+        "student_test": STUDENT_TEST_DIR,
+        "train": TRAIN_DIR,
+    }
+    target_dir = mapping.get(partition, EVALUATOR_TEST_DIR)
+    partition_name = partition if partition in mapping else "evaluator_test"
+
     trip_ids = []
     if os.path.isdir(target_dir):
         for tid in sorted(os.listdir(target_dir)):
